@@ -1,10 +1,36 @@
 #include "vk.h"
 #include "wl.h"
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_wayland.h>
+
+/*
+ * Vulkan initialization
+ *
+ * vk_init() depends on wl_init() having succeeded because
+ * it needs:
+ *
+ *     wl.display
+ *     wl.surface
+ *
+ * It then creates:
+ *
+ *     VkInstance
+ *          |
+ *     VkSurfaceKHR (Wayland Surface)
+ *          |
+ *     physical device
+ *          |
+ *     graphics + presentation queue family
+ *          |
+ *     VkDevice
+ *          |
+ *     VkQueue
+ */
 
 bool vk_init(struct Vk* vk, struct Wl* wl) {
     memset(vk, 0, sizeof(*vk));
@@ -47,83 +73,123 @@ bool vk_init(struct Vk* vk, struct Wl* wl) {
             stderr,
             "vkCreateInstance failed with error code %d\n",
             result);
-        return false;
+        goto fail;
     }
 
-    // Enumerate over physical devices.
-    // First call to get the number of devices.
+    /*
+     * --------------------------------------------------------
+     * Vulkan Wayland surface
+     * --------------------------------------------------------
+     *
+     * This must happen before physical-device selection,
+     * because we want to test queue-family presentation
+     * support against this actual VkSurfaceKHR.
+     */
+
+    VkWaylandSurfaceCreateInfoKHR surface_info = {0};
+    surface_info.sType =
+        VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+    surface_info.display = wl->display;
+    surface_info.surface = wl->surface;
+
+    result = vkCreateWaylandSurfaceKHR(
+        vk->inst, &surface_info, NULL, &vk->surf);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr,
+                "vkCreateWaylandSurfaceKHR failed with error code %d\n",
+                result);
+        goto fail;
+    }
+
+    /*
+     * --------------------------------------------------------
+     * Physical devices
+     * --------------------------------------------------------
+     */
+
     uint32_t ndev = 0;
+
     result =
         vkEnumeratePhysicalDevices(vk->inst, &ndev, NULL);
     if (result != VK_SUCCESS) {
         fprintf(stderr,
-                "vkEnumeratePhysicalDevices failed with "
-                "error code %d\n",
+                "vkEnumeratePhysicalDevices failed with error code %d\n",
                 result);
-        return false;
-    }
-    // Capping the number of devices at 8.
-    if (ndev > 8) {
-        ndev = 8;
-    }
-
-    // Second call to get the devices.
-    VkPhysicalDevice devices[8] = {0};
-    result = vkEnumeratePhysicalDevices(vk->inst, &ndev,
-                                        devices);
-    if (result != VK_SUCCESS) {
-        fprintf(stderr,
-                "vkEnumeratePhysicalDevices failed with "
-                "error code %d\n",
-                result);
-        return false;
+        goto fail;
     }
 
     if (ndev == 0) {
-        fprintf(stderr,
-                "No accelerator devices were found");
-        return false;
+        fprintf(stderr, "No physical devices were found\n");
+        goto fail;
     }
 
-    // Pick device + queue family.
+    if (ndev > 8)
+        ndev = 8;
+
+    VkPhysicalDevice devices[8] = {0};
+
+    result = vkEnumeratePhysicalDevices(vk->inst, &ndev,
+                                        devices);
+
+    if (result != VK_SUCCESS) {
+        fprintf(stderr,
+                "vkEnumeratePhysicalDevices failed with error code %d\n",
+                result);
+        goto fail;
+    }
+
+    /*
+     * --------------------------------------------------------
+     * Find physical device + queue family
+     * --------------------------------------------------------
+     */
+
     uint32_t picked = 0;
     uint32_t qfam = 0;
     bool found = false;
-    // Try each GPU in turn until one offers a
-    // graphics queue able to present to Wayland.
-    for (size_t i = 0; i < ndev && !found; i++) {
-        VkQueueFamilyProperties fams[8] = {0};
 
-        VkPhysicalDeviceProperties props = {0};
-        vkGetPhysicalDeviceProperties(devices[i], &props);
-        // nfam is the number of queue families
-        // this GPU exposes. Families group queues
-        // by capability, such as graphics or
-        // compute. Count first, fill after.
+    for (uint32_t i = 0; i < ndev && !found; i++) {
         uint32_t nfam = 0;
+
         vkGetPhysicalDeviceQueueFamilyProperties(
             devices[i], &nfam, NULL);
 
-        // Capping nfam at 8.
-        if (nfam > 8) {
+        if (nfam > 8)
             nfam = 8;
-        }
-        // Second call to fetch the families.
+
+        VkQueueFamilyProperties fams[8] = {0};
+
         vkGetPhysicalDeviceQueueFamilyProperties(
             devices[i], &nfam, fams);
 
-        // Test each family: keep graphics-capable
-        // families with Wayland present support.
-        // Record the winners in picked and qfam.
-        for (size_t f = 0; f < nfam; f++) {
-            // Making sure we find the graphics specialized
-            // queue.
+        for (uint32_t f = 0; f < nfam; f++) {
+            /*
+             * We need a graphics-capable queue.
+             */
             if (!(fams[f].queueFlags &
-                  VK_QUEUE_GRAPHICS_BIT))
+                  VK_QUEUE_GRAPHICS_BIT)) {
                 continue;
+            }
 
-            if (!vkGetPhysicalDeviceWaylandPresentationSupportKHR(
-                    devices[i], f, wl->display))
+            /*
+             * Check whether this queue family can present
+             * to our actual Wayland VkSurfaceKHR.
+             */
+            VkBool32 present_supported = VK_FALSE;
+
+            result = vkGetPhysicalDeviceSurfaceSupportKHR(
+                devices[i], f, vk->surf,
+                &present_supported);
+
+            if (result != VK_SUCCESS) {
+                fprintf(
+                    stderr,
+                    "vkGetPhysicalDeviceSurfaceSupportKHR failed with error code %d\n",
+                    result);
+                goto fail;
+            }
+
+            if (!present_supported)
                 continue;
 
             picked = i;
@@ -132,22 +198,88 @@ bool vk_init(struct Vk* vk, struct Wl* wl) {
             break;
         }
     }
+
     if (!found) {
-        fprintf(
-            stderr,
-            "No fitting accelerator devices were found");
-        return false;
+        fprintf(stderr,
+                "No physical device with a graphics + present queue was found\n");
+        goto fail;
     }
+
     vk->phys = devices[picked];
 
-    // Logical device and queue.
+    /*
+     * --------------------------------------------------------
+     * Logical device
+     * --------------------------------------------------------
+     */
+
+    float queue_priority = 1.0f;
+
+    VkDeviceQueueCreateInfo queue_info = {0};
+    queue_info.sType =
+        VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue_info.queueFamilyIndex = qfam;
+    queue_info.queueCount = 1;
+    queue_info.pQueuePriorities = &queue_priority;
+
+    /*
+     * The swapchain extension is required for presenting
+     * Vulkan images to VkSurfaceKHR.
+     */
+    const char* device_exts[] = {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    };
+
+    VkDeviceCreateInfo device_info = {0};
+    device_info.sType =
+        VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    device_info.queueCreateInfoCount = 1;
+    device_info.pQueueCreateInfos = &queue_info;
+    device_info.enabledExtensionCount =
+        sizeof(device_exts) / sizeof(device_exts[0]);
+    device_info.ppEnabledExtensionNames = device_exts;
+
+    result = vkCreateDevice(vk->phys, &device_info, NULL,
+                            &vk->dev);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr,
+                "vkCreateDevice failed with error code %d\n",
+                result);
+        goto fail;
+    }
+    
+    vkGetDeviceQueue(vk->dev, qfam, 0, &vk->queue); // Get the queue from the selected queue family
 
     return true;
+
+fail:
+    vk_finish(vk);
+    return false;
 }
 
+/* cleanup/destroy resources IN ORDER(VERY IMPORTANT):
+* vkDevice
+* vkSurfaceKHR
+* vkInstance
+*/
+
 void vk_finish(struct Vk* vk) {
+    if (vk->dev != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(vk->dev);
+        vkDestroyDevice(vk->dev, NULL);
+        vk->dev = VK_NULL_HANDLE;
+        vk->queue = VK_NULL_HANDLE;
+    }
+
+    if (vk->surf != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(vk->inst, vk->surf, NULL);
+        vk->surf = VK_NULL_HANDLE;
+    }
+
     if (vk->inst != VK_NULL_HANDLE) {
         vkDestroyInstance(vk->inst, NULL);
         vk->inst = VK_NULL_HANDLE;
     }
+
+    vk->phys = VK_NULL_HANDLE;
 }
