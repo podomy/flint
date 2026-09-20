@@ -5,3 +5,4 @@ certs/
 current.log
 *.o
 .cache/
+/.vs
