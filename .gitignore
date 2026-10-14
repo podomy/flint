@@ -2,6 +2,7 @@
 bin/
 deps/
 certs/
+generated/
 current.log
 *.o
 .cache/
